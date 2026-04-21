@@ -1,9 +1,134 @@
 import express, { Request, Response } from 'express';
+import { existsSync, readFileSync } from 'fs';
+import path from 'path';
 import puppeteer from 'puppeteer';
 import { Pool } from 'pg';
 
+function loadEnvFile(): void {
+    const envFilePath = path.resolve(process.cwd(), '.env');
+
+    if (!existsSync(envFilePath)) {
+        return;
+    }
+
+    const lines = readFileSync(envFilePath, 'utf8').split(/\r?\n/);
+
+    for (const [index, line] of lines.entries()) {
+        const trimmedLine = line.trim();
+
+        if (!trimmedLine || trimmedLine.startsWith('#')) {
+            continue;
+        }
+
+        const separatorIndex = trimmedLine.indexOf('=');
+
+        if (separatorIndex === -1) {
+            throw new Error(`Invalid .env line ${index + 1}. Expected KEY=VALUE.`);
+        }
+
+        const key = trimmedLine.slice(0, separatorIndex).trim();
+        let value = trimmedLine.slice(separatorIndex + 1).trim();
+
+        if (!key) {
+            throw new Error(`Invalid .env line ${index + 1}. Variable name is missing.`);
+        }
+
+        if (
+            (value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))
+        ) {
+            value = value.slice(1, -1);
+        }
+
+        if (process.env[key] === undefined) {
+            process.env[key] = value;
+        }
+    }
+}
+
+function getStringEnv(name: string, defaultValue?: string): string {
+    const rawValue = process.env[name];
+
+    if (rawValue !== undefined) {
+        const trimmedValue = rawValue.trim();
+
+        if (trimmedValue) {
+            return trimmedValue;
+        }
+
+        throw new Error(`Environment variable ${name} cannot be empty.`);
+    }
+
+    if (defaultValue !== undefined) {
+        return defaultValue;
+    }
+
+    throw new Error(`Missing required environment variable: ${name}`);
+}
+
+function getNumberEnv(name: string, defaultValue: number): number {
+    const rawValue = process.env[name];
+
+    if (rawValue === undefined) {
+        return defaultValue;
+    }
+
+    const trimmedValue = rawValue.trim();
+
+    if (!trimmedValue) {
+        throw new Error(`Environment variable ${name} cannot be empty.`);
+    }
+
+    const parsedValue = Number(trimmedValue);
+
+    if (!Number.isInteger(parsedValue) || parsedValue <= 0) {
+        throw new Error(
+            `Environment variable ${name} must be a positive integer. Received: "${trimmedValue}"`
+        );
+    }
+
+    return parsedValue;
+}
+
+function getOptionalStringEnv(name: string, defaultValue = ''): string {
+    const rawValue = process.env[name];
+
+    if (rawValue === undefined) {
+        return defaultValue;
+    }
+
+    return rawValue.trim();
+}
+
+interface AppConfig {
+    port: number;
+    dbHost: string;
+    dbPort: number;
+    dbName: string;
+    dbUser: string;
+    dbPassword: string;
+}
+
+const config: AppConfig = (() => {
+    try {
+        loadEnvFile();
+
+        return {
+            port: getNumberEnv('PORT', 3000),
+            dbHost: getStringEnv('DB_HOST', 'localhost'),
+            dbPort: getNumberEnv('DB_PORT', 5432),
+            dbName: getStringEnv('DB_NAME', 'sneaker_db'),
+            dbUser: getStringEnv('DB_USER', 'postgres'),
+            dbPassword: getOptionalStringEnv('DB_PASSWORD'),
+        };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown configuration error.';
+        console.error(`Configuration error: ${message}`);
+        process.exit(1);
+    }
+})();
+
 const app = express();
-const PORT: number = 3000;
 
 interface Sneaker {
     brand: string;
@@ -15,9 +140,11 @@ interface Sneaker {
 
 // 1. Initialize Postgres Connection Pool
 const pool = new Pool({
-    host: 'localhost',
-    database: 'sneaker_db',
-    port: 5432,
+    host: config.dbHost,
+    database: config.dbName,
+    port: config.dbPort,
+    user: config.dbUser,
+    password: config.dbPassword,
 });
 
 // Function to initialize the database table
@@ -152,7 +279,7 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
 });
 
 // Start the server
-app.listen(PORT, () => {
-    console.log(`Server is running at http://localhost:${PORT}`);
-    console.log(`To trigger the scraper, visit http://localhost:${PORT}/scrape`);
+app.listen(config.port, () => {
+    console.log(`Server is running at http://localhost:${config.port}`);
+    console.log(`To trigger the scraper, visit http://localhost:${config.port}/scrape`);
 });

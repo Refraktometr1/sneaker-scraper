@@ -8,26 +8,40 @@ Small TypeScript API that scrapes sneaker products from Ochsner Sport and saves 
 - Opens the Ochsner Sport sneaker listing page with Puppeteer
 - Reads the first 10 product tiles
 - Extracts `brand`, `model`, `price`, `oldPrice`, and `url`
-- Saves `brand`, `model`, and `price` into a local PostgreSQL table
+- Saves `brand`, `model`, and `price` into a PostgreSQL table
 - Returns the scraped items as JSON from `GET /scrape`
 
 ## Requirements
 
 - Node.js and npm
-- PostgreSQL running locally on port `5432`
-- A database named `sneaker_db`
-
-The app currently connects with:
-
-- host: `localhost`
-- port: `5432`
-- database: `sneaker_db`
+- PostgreSQL
 
 ## Install
 
 ```bash
 npm install
 ```
+
+## Environment variables
+
+1. Copy the example file:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` with your local PostgreSQL values.
+
+The app loads `.env` automatically on startup. If `PORT` or `DB_PORT` is invalid, or if a required value is blank, the server exits with a clear configuration error.
+
+Default local values used when a variable is not set:
+
+- `PORT=3000`
+- `DB_HOST=localhost`
+- `DB_PORT=5432`
+- `DB_NAME=sneaker_db`
+- `DB_USER=postgres`
+- `DB_PASSWORD=` (blank is allowed for local setups that do not use a password)
 
 ## Scripts
 
@@ -42,6 +56,13 @@ npm test
 ## Run in development
 
 ```bash
+npm run dev
+```
+
+Example with `.env`:
+
+```bash
+cp .env.example .env
 npm run dev
 ```
 
@@ -62,6 +83,13 @@ http://localhost:3000/scrape
 ```bash
 npm run build
 npm run start
+```
+
+Example with explicit overrides:
+
+```bash
+PORT=4000 DB_NAME=sneaker_db npm run dev
+PORT=4000 DB_NAME=sneaker_db npm run start
 ```
 
 ## API response
