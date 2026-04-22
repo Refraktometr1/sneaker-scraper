@@ -138,6 +138,11 @@ interface Sneaker {
     url: string;
 }
 
+const OCHSNER_SNEAKERS_URL =
+    'https://www.ochsnersport.ch/de/shop/herren-schuhe-sneakers-alle-sneakermarken-00044952-c.html';
+const MIN_SEARCH_RESULTS = 10;
+const MAX_SNEAKERS_TO_SAVE = 10;
+
 // 1. Initialize Postgres Connection Pool
 const pool = new Pool({
     host: config.dbHost,
@@ -191,68 +196,73 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
         page.setDefaultNavigationTimeout(60000);
         page.setDefaultTimeout(12000);
 
-        await page.goto(
-            'https://www.ochsnersport.ch/de/shop/herren-schuhe-sneakers-alle-sneakermarken-00044952-c.html',
-            {
-                waitUntil: 'load',
-                timeout: 60000,
-            }
-        );
-
-        await page.waitForSelector('section[data-id^="product-tile"]', {
+        await page.goto(OCHSNER_SNEAKERS_URL, {
+            waitUntil: 'networkidle2',
             timeout: 60000,
         });
 
-        // We only need the first 10 cards, so no scrolling is required.
-        // Just make sure at least 10 tiles are rendered (fall back to whatever is available).
+        console.log('Waiting for Nuxt search data to be available...');
         await page
             .waitForFunction(
-                () =>
-                    document.querySelectorAll('section[data-id^="product-tile"]').length >= 10,
-                { timeout: 15000 }
+                (minimumSearchResults: number) => {
+                    const state = (window as Window & { $nuxt?: any }).$nuxt?.$store?.state;
+                    const searchResults = state?.search?.results?.[1];
+                    const searchPageProducts = state?.products?.products?.searchPage;
+
+                    return (
+                        Array.isArray(searchResults) &&
+                        searchResults.length >= minimumSearchResults &&
+                        typeof searchPageProducts === 'object' &&
+                        searchPageProducts !== null &&
+                        Object.keys(searchPageProducts).length > 0
+                    );
+                },
+                { timeout: 15000 },
+                MIN_SEARCH_RESULTS
             )
             .catch(() => {
-                console.warn('Fewer than 10 tiles found, continuing with what is available.');
+                console.warn(
+                    `Timed out waiting for ${MIN_SEARCH_RESULTS} search results in Nuxt state. Continuing with what is available.`
+                );
             });
 
-        const sneakers: Sneaker[] = await page.evaluate(() => {
-            const toText = (el: Element | null): string =>
-                (el as HTMLElement | null)?.innerText.trim() || '';
-
-            const productNodes = Array.from(
-                document.querySelectorAll('section[data-id^="product-tile"]')
-            ).slice(0, 10); // take only the first 10
-
+        const sneakers: Sneaker[] = await page.evaluate((maxSneakers: number) => {
+            const state = (window as Window & { $nuxt?: any }).$nuxt?.$store?.state;
+            const searchResults = state?.search?.results?.[1] ?? [];
+            const searchPageProducts = state?.products?.products?.searchPage ?? {};
             const seen = new Set<string>();
 
-            return productNodes
-                .map((card) => {
-                    const linkEl = card.querySelector('a[data-name="link"]') as HTMLAnchorElement | null;
+            return searchResults
+                .slice(0, maxSneakers)
+                .map((result: { productCode?: string }) => {
+                    const product = result.productCode ? searchPageProducts[result.productCode] : null;
 
-                    const brand = toText(card.querySelector('[data-id="brand-name"]')) || 'Brand not found';
-                    const model = toText(card.querySelector('[data-id="product-name"]')) || 'Model not found';
-
-                    const priceEl =
-                        card.querySelector('[data-id="selling-price"]') ||
-                        card.querySelector('[data-id="price"]');
-
-                    const oldPriceEl = card.querySelector('[data-id="cross-price"]');
+                    if (!product) {
+                        return null;
+                    }
 
                     return {
-                        brand,
-                        model,
-                        price: toText(priceEl) || 'Price not found',
-                        oldPrice: toText(oldPriceEl) || undefined,
-                        url: linkEl?.href || '',
+                        brand: product.brand?.name || 'Brand not found',
+                        model: product.name || 'Model not found',
+                        price: product.price?.selling?.formattedValue || 'Price not found',
+                        oldPrice: product.price?.cross?.formattedValue || undefined,
+                        url: product.url
+                            ? new URL(product.url, window.location.origin).href
+                            : '',
                     };
                 })
-                .filter(item => {
+                .filter((item: Sneaker | null): item is Sneaker => item !== null)
+                .filter((item: Sneaker) => {
                     const key = `${item.brand}|${item.model}|${item.price}|${item.url}`;
-                    if (seen.has(key)) return false;
+
+                    if (seen.has(key)) {
+                        return false;
+                    }
+
                     seen.add(key);
                     return true;
                 });
-        });
+        }, MAX_SNEAKERS_TO_SAVE);
 
         // 4. Save the scraped data to Postgres
         const insertQuery = 'INSERT INTO sneakers (brand, model, price) VALUES ($1, $2, $3)';
