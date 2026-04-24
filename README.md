@@ -130,6 +130,38 @@ Current CI checks:
 - `npm run typecheck`
 - `npm run build`
 
+## Pull request review
+
+Pull requests now use two separate checks before merge:
+
+- `CI` on GitHub-hosted runners for install, typecheck, and build
+- `Ollama PR Review` on your self-hosted runner for local AI feedback
+
+### Self-hosted Ollama runner
+
+To run the PR review job on your machine:
+
+- register a GitHub self-hosted runner for this repository
+- add an `ollama` label to that runner
+- keep the Ollama service running locally
+- make sure `gemma4:26b` is already pulled
+
+The review workflow only runs for same-repo pull requests. It posts one managed PR comment and updates that same comment on later pushes.
+
+Branch protection on `develop` and `main` should require both checks before merge:
+
+- `CI`
+- `Ollama PR Review`
+
+For local script testing, you can set `OLLAMA_REVIEW_DRY_RUN=1` and run:
+
+```bash
+GITHUB_EVENT_PATH=/path/to/event.json \
+OLLAMA_BASE_REF=origin/develop \
+OLLAMA_REVIEW_DRY_RUN=1 \
+npx ts-node scripts/ollama-pr-review.ts
+```
+
 ## Branch strategy
 
 This repo is set up for:

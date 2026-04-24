@@ -6,9 +6,10 @@
     "moduleResolution": "node16",
     "esModuleInterop": true,
     "strict": true,
+    "types": ["node"],
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "outDir": "./dist"
   },
-  "include": ["server.ts"]
+  "include": ["server.ts", "scripts/**/*.ts"]
 }
