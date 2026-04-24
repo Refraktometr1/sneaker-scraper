@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import { existsSync, readFileSync } from 'fs';
 import path from 'path';
 import puppeteer from 'puppeteer';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 
 function loadEnvFile(): void {
     const envFilePath = path.resolve(process.cwd(), '.env');
@@ -130,12 +130,16 @@ const config: AppConfig = (() => {
 
 const app = express();
 
-interface Sneaker {
+interface SneakerResponse {
     brand: string;
     model: string;
     price: string;
     oldPrice?: string;
     url: string;
+}
+
+interface ScrapedSneaker extends SneakerResponse {
+    productCode?: string;
 }
 
 const OCHSNER_SNEAKERS_URL =
@@ -156,18 +160,68 @@ const pool = new Pool({
 async function initDB() {
     const createTableQuery = `
         CREATE TABLE IF NOT EXISTS sneakers (
-                                                id SERIAL PRIMARY KEY,
-                                                brand VARCHAR(255),
+            id SERIAL PRIMARY KEY,
+            brand VARCHAR(255),
             model VARCHAR(255),
             price VARCHAR(50),
+            product_code VARCHAR(255),
             scrape_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+        );
     `;
+    const addProductCodeColumnQuery = `
+        ALTER TABLE sneakers
+        ADD COLUMN IF NOT EXISTS product_code VARCHAR(255);
+    `;
+    const deleteLegacyDuplicateRowsQuery = `
+        WITH ranked_sneakers AS (
+            SELECT
+                id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY brand, model, price
+                    ORDER BY id
+                ) AS row_number
+            FROM sneakers
+            WHERE product_code IS NULL
+        )
+        DELETE FROM sneakers
+        WHERE id IN (
+            SELECT id
+            FROM ranked_sneakers
+            WHERE row_number > 1
+        );
+    `;
+    const createProductCodeIndexQuery = `
+        CREATE UNIQUE INDEX IF NOT EXISTS sneakers_product_code_key
+        ON sneakers (product_code);
+    `;
+    let client: PoolClient | undefined;
+
     try {
-        await pool.query(createTableQuery);
-        console.log("Postgres database initialized successfully.");
+        client = await pool.connect();
+        await client.query('BEGIN');
+        await client.query(createTableQuery);
+        await client.query(addProductCodeColumnQuery);
+
+        const deleteResult = await client.query(deleteLegacyDuplicateRowsQuery);
+        await client.query(createProductCodeIndexQuery);
+        await client.query('COMMIT');
+
+        const removedDuplicateCount = deleteResult.rowCount ?? 0;
+
+        if (removedDuplicateCount > 0) {
+            console.log(`Removed ${removedDuplicateCount} legacy duplicate sneaker rows.`);
+        }
+
+        console.log('Postgres database initialized successfully.');
     } catch (err) {
-        console.error("Error creating table:", err);
+        if (client) {
+            await client.query('ROLLBACK').catch((rollbackError) => {
+                console.error('Error rolling back database initialization:', rollbackError);
+            });
+        }
+        console.error('Error initializing database:', err);
+    } finally {
+        client?.release();
     }
 }
 
@@ -226,7 +280,7 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
                 );
             });
 
-        const sneakers: Sneaker[] = await page.evaluate((maxSneakers: number) => {
+        const sneakers: ScrapedSneaker[] = await page.evaluate((maxSneakers: number) => {
             const state = (window as Window & { $nuxt?: any }).$nuxt?.$store?.state;
             const searchResults = state?.search?.results?.[1] ?? [];
             const searchPageProducts = state?.products?.products?.searchPage ?? {};
@@ -242,6 +296,7 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
                     }
 
                     return {
+                        productCode: result.productCode,
                         brand: product.brand?.name || 'Brand not found',
                         model: product.name || 'Model not found',
                         price: product.price?.selling?.formattedValue || 'Price not found',
@@ -251,9 +306,10 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
                             : '',
                     };
                 })
-                .filter((item: Sneaker | null): item is Sneaker => item !== null)
-                .filter((item: Sneaker) => {
-                    const key = `${item.brand}|${item.model}|${item.price}|${item.url}`;
+                .filter((item: ScrapedSneaker | null): item is ScrapedSneaker => item !== null)
+                .filter((item: ScrapedSneaker) => {
+                    const key =
+                        item.productCode || `${item.brand}|${item.model}|${item.price}|${item.url}`;
 
                     if (seen.has(key)) {
                         return false;
@@ -264,18 +320,41 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
                 });
         }, MAX_SNEAKERS_TO_SAVE);
 
+        const responseData: SneakerResponse[] = sneakers.map(
+            ({ productCode: _productCode, ...responseSneaker }) => responseSneaker
+        );
+
         // 4. Save the scraped data to Postgres
-        const insertQuery = 'INSERT INTO sneakers (brand, model, price) VALUES ($1, $2, $3)';
+        const insertQuery = `
+            INSERT INTO sneakers (brand, model, price, product_code)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (product_code) DO NOTHING
+        `;
+        let savedCount = 0;
 
         for (const sneaker of sneakers) {
-            await pool.query(insertQuery, [sneaker.brand, sneaker.model, sneaker.price]);
+            if (!sneaker.productCode) {
+                console.warn(
+                    `Skipping sneaker without productCode: ${sneaker.brand} ${sneaker.model}`
+                );
+                continue;
+            }
+
+            const insertResult = await pool.query(insertQuery, [
+                sneaker.brand,
+                sneaker.model,
+                sneaker.price,
+                sneaker.productCode,
+            ]);
+
+            savedCount += insertResult.rowCount ?? 0;
         }
 
-        console.log(`Successfully scraped and saved ${sneakers.length} sneakers to Postgres!`);
+        console.log(`Successfully scraped and saved ${savedCount} sneakers to Postgres!`);
         res.json({
             message: 'Success!',
-            saved_count: sneakers.length,
-            data: sneakers
+            saved_count: savedCount,
+            data: responseData
         });
 
     } catch (error) {

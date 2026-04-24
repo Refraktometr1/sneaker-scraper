@@ -10,7 +10,7 @@ This project:
 - opens the Ochsner Sport sneaker listing page with Puppeteer
 - reads the first 10 product results
 - extracts `brand`, `model`, `price`, `oldPrice`, and `url`
-- saves `brand`, `model`, and `price` into PostgreSQL
+- saves `brand`, `model`, `price`, and `productCode` into PostgreSQL
 - returns the scraped items as JSON from `GET /scrape`
 
 ## Tech stack
@@ -144,7 +144,7 @@ This repo is set up for:
 Successful requests return JSON with:
 
 - `message`
-- `saved_count`
+- `saved_count` (new rows inserted into PostgreSQL)
 - `data`
 
 ## Database
@@ -157,10 +157,13 @@ Stored columns:
 - `brand`
 - `model`
 - `price`
+- `product_code`
 - `scrape_date`
+
+The app also removes legacy exact duplicates on startup for rows that do not have a `product_code` yet. It keeps one row per identical `brand`, `model`, and `price` combination before creating the unique product index.
 
 ## Notes
 
 - The scraper is hardcoded to Ochsner Sport.
-- Repeated `/scrape` calls can insert duplicate rows.
+- Repeated `/scrape` calls do not insert duplicate rows for the same `productCode`.
 - `oldPrice` and `url` are returned in the API response but are not stored in the database.
