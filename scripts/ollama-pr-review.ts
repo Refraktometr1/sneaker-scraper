@@ -8,13 +8,14 @@ const DEFAULT_BASE_REF = 'origin/main';
 const MAX_FILES_IN_PROMPT = 20;
 const MAX_DIFF_CHARACTERS = 45_000;
 const MAX_COMMENT_CHARACTERS = 60_000;
-const REQUIRED_SECTIONS = [
-    'Summary',
-    'What looks good',
-    'Risks',
-    'Suggested improvements',
-    'Verdict',
-] as const;
+
+interface ReviewPayload {
+    summary: string;
+    whatLooksGood: string[];
+    risks: string[];
+    suggestedImprovements: string[];
+    verdict: string;
+}
 
 interface PullRequestEvent {
     pull_request?: {
@@ -158,21 +159,17 @@ function buildPrompt(params: {
         'Do not repeat the diff back to the reader.',
         'If there are no meaningful concerns, say that clearly.',
         'This review is advisory. Do not claim to approve or block the PR on behalf of GitHub.',
-        'Respond with Markdown only. Do not add any introduction or closing text outside the required headings.',
-        'Use exactly these Markdown sections as level-2 headings and in this exact order:',
-        '## Summary',
-        '## What looks good',
-        '## Risks',
-        '## Suggested improvements',
-        '## Verdict',
+        'Respond with JSON only. Do not wrap the JSON in Markdown fences.',
+        'Return exactly one JSON object with this schema:',
+        '{"summary":"string","whatLooksGood":["string"],"risks":["string"],"suggestedImprovements":["string"],"verdict":"string"}',
         '',
-        'Formatting rules:',
-        '- Keep each section short.',
-        '- Use flat bullet lists.',
-        '- Mention file paths when you call out a risk or suggestion.',
-        '- In "Risks", list only actionable concerns. If none, write "- No major risks found in the included diff."',
-        '- In "Suggested improvements", list only concrete next steps. If none, write "- No follow-up changes are required based on the included diff."',
-        '- In "Verdict", use one short sentence only.',
+        'JSON rules:',
+        '- Keep every value short and specific.',
+        '- Mention file paths inside items when you call out a risk or suggestion.',
+        '- "whatLooksGood", "risks", and "suggestedImprovements" must always be arrays of strings.',
+        '- If there are no major risks, set "risks" to ["No major risks found in the included diff."].',
+        '- If there are no follow-up changes, set "suggestedImprovements" to ["No follow-up changes are required based on the included diff."].',
+        '- "verdict" must be one short sentence only.',
         '',
         `Pull request: #${params.pullRequestNumber}`,
         `URL: ${params.url}`,
@@ -243,27 +240,119 @@ async function requestReviewFromOllama(
     return payload.response.trim();
 }
 
-function ensureMarkdownSections(review: string): string {
-    const headingsArePresent = REQUIRED_SECTIONS.every((section) =>
-        new RegExp(`^##\\s+${section}\\s*$`, 'im').test(review)
-    );
+function extractJsonObject(response: string): string | null {
+    const fencedMatch = response.match(/```json\s*([\s\S]*?)```/i);
 
-    if (headingsArePresent) {
-        return review.trim();
+    if (fencedMatch?.[1]) {
+        return fencedMatch[1].trim();
     }
 
+    const firstBrace = response.indexOf('{');
+    const lastBrace = response.lastIndexOf('}');
+
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+        return null;
+    }
+
+    return response.slice(firstBrace, lastBrace + 1).trim();
+}
+
+function normalizeString(value: unknown, fallback: string): string {
+    return typeof value === 'string' && value.trim().length > 0 ? value.trim() : fallback;
+}
+
+function normalizeStringArray(value: unknown, fallback: string): string[] {
+    if (Array.isArray(value)) {
+        const items = value
+            .filter((entry): entry is string => typeof entry === 'string')
+            .map((entry) => entry.trim())
+            .filter(Boolean);
+
+        if (items.length > 0) {
+            return items;
+        }
+    }
+
+    if (typeof value === 'string' && value.trim().length > 0) {
+        return [value.trim()];
+    }
+
+    return [fallback];
+}
+
+function parseReviewPayload(response: string): ReviewPayload | null {
+    const jsonObject = extractJsonObject(response);
+
+    if (!jsonObject) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(jsonObject) as Record<string, unknown>;
+
+        return {
+            summary: normalizeString(
+                parsed.summary,
+                'The local model returned feedback, but the summary field was empty.'
+            ),
+            whatLooksGood: normalizeStringArray(
+                parsed.whatLooksGood,
+                'The Ollama review completed successfully.'
+            ),
+            risks: normalizeStringArray(
+                parsed.risks,
+                'The local model did not provide structured risk items.'
+            ),
+            suggestedImprovements: normalizeStringArray(
+                parsed.suggestedImprovements,
+                'No detailed suggestions were returned.'
+            ),
+            verdict: normalizeString(
+                parsed.verdict,
+                'Advisory feedback only. Human review is still required before merge.'
+            ),
+        };
+    } catch {
+        return null;
+    }
+}
+
+function renderMarkdownList(items: string[]): string {
+    return items.map((item) => `- ${item}`).join('\n');
+}
+
+function buildStructuredReview(review: ReviewPayload): string {
     return [
         '## Summary',
-        'The local model returned feedback, but it did not follow the requested template exactly.',
+        review.summary,
+        '',
+        '## What looks good',
+        renderMarkdownList(review.whatLooksGood),
+        '',
+        '## Risks',
+        renderMarkdownList(review.risks),
+        '',
+        '## Suggested improvements',
+        renderMarkdownList(review.suggestedImprovements),
+        '',
+        '## Verdict',
+        review.verdict,
+    ].join('\n');
+}
+
+function buildUnstructuredFallbackReview(response: string): string {
+    return [
+        '## Summary',
+        'The local model returned feedback, but it did not follow the required JSON format exactly.',
         '',
         '## What looks good',
         '- The Ollama review completed successfully.',
         '',
         '## Risks',
-        '- The raw response may mix multiple concerns together because the expected headings were missing.',
+        '- The raw response may mix multiple concerns together because the structured fields were missing.',
         '',
         '## Suggested improvements',
-        review.trim() || 'No detailed suggestions were returned.',
+        response.trim() || 'No detailed suggestions were returned.',
         '',
         '## Verdict',
         'Advisory feedback only. Human review is still required before merge.',
@@ -417,28 +506,38 @@ async function main(): Promise<void> {
 
     await ensureModelExists(ollamaUrl, model);
 
+    const ollamaResponse =
+        limitedFiles.length === 0
+            ? null
+            : await requestReviewFromOllama(
+                  ollamaUrl,
+                  model,
+                  buildPrompt({
+                      pullRequestNumber: pullRequest.number,
+                      title: pullRequest.title,
+                      body: pullRequest.body || '',
+                      url: pullRequest.html_url,
+                      baseRef: diffBaseRef,
+                      changedFiles: limitedFiles,
+                      omittedFileCount,
+                      diff,
+                      diffWasTruncated: truncated,
+                  })
+              );
+
     const reviewBody =
         limitedFiles.length === 0
             ? buildFallbackReview(
                   'No source-code diff remained after filtering out `package-lock.json`.'
               )
-            : ensureMarkdownSections(
-                  await requestReviewFromOllama(
-                      ollamaUrl,
-                      model,
-                      buildPrompt({
-                          pullRequestNumber: pullRequest.number,
-                          title: pullRequest.title,
-                          body: pullRequest.body || '',
-                          url: pullRequest.html_url,
-                          baseRef: diffBaseRef,
-                          changedFiles: limitedFiles,
-                          omittedFileCount,
-                          diff,
-                          diffWasTruncated: truncated,
-                      })
-                  )
-              );
+            : (() => {
+                  const response = ollamaResponse ?? '';
+                  const parsedReview = parseReviewPayload(response);
+
+                  return parsedReview
+                      ? buildStructuredReview(parsedReview)
+                      : buildUnstructuredFallbackReview(response);
+              })();
 
     const commentBody = buildCommentBody(model, reviewBody);
 
