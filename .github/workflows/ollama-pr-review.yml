@@ -45,7 +45,7 @@ jobs:
 
       - name: Review pull request with Ollama
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           OLLAMA_BASE_REF: origin/${{ github.event.pull_request.base.ref }}
           OLLAMA_MODEL: gemma4:26b
         run: npx ts-node scripts/ollama-pr-review.ts
