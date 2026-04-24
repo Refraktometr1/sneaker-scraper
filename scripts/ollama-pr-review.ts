@@ -8,6 +8,27 @@ const DEFAULT_BASE_REF = 'origin/main';
 const MAX_FILES_IN_PROMPT = 20;
 const MAX_DIFF_CHARACTERS = 45_000;
 const MAX_COMMENT_CHARACTERS = 60_000;
+const REVIEW_PAYLOAD_SCHEMA = {
+    type: 'object',
+    properties: {
+        summary: { type: 'string' },
+        whatLooksGood: {
+            type: 'array',
+            items: { type: 'string' },
+        },
+        risks: {
+            type: 'array',
+            items: { type: 'string' },
+        },
+        suggestedImprovements: {
+            type: 'array',
+            items: { type: 'string' },
+        },
+        verdict: { type: 'string' },
+    },
+    required: ['summary', 'whatLooksGood', 'risks', 'suggestedImprovements', 'verdict'],
+    additionalProperties: false,
+} as const;
 
 interface ReviewPayload {
     summary: string;
@@ -16,6 +37,11 @@ interface ReviewPayload {
     suggestedImprovements: string[];
     verdict: string;
 }
+
+type OllamaChatMessage = {
+    role: 'system' | 'user';
+    content: string;
+};
 
 interface PullRequestEvent {
     pull_request?: {
@@ -46,8 +72,10 @@ interface OllamaTagsResponse {
     }>;
 }
 
-interface OllamaGenerateResponse {
-    response?: string;
+interface OllamaChatResponse {
+    message?: {
+        content?: string;
+    };
     done?: boolean;
     error?: string;
 }
@@ -126,7 +154,7 @@ function trimDiff(diff: string): { diff: string; truncated: boolean } {
     };
 }
 
-function buildPrompt(params: {
+function buildMessages(params: {
     pullRequestNumber: number;
     title: string;
     body: string;
@@ -136,7 +164,7 @@ function buildPrompt(params: {
     omittedFileCount: number;
     diff: string;
     diffWasTruncated: boolean;
-}): string {
+}): OllamaChatMessage[] {
     const changedFilesList =
         params.changedFiles.length > 0
             ? params.changedFiles.map((file) => `- ${file}`).join('\n')
@@ -149,31 +177,23 @@ function buildPrompt(params: {
         ? '\nThe diff was truncated to fit the local model context window.'
         : '';
 
-    return [
+    const systemPrompt = [
         'You are a senior software engineer reviewing a GitHub pull request.',
         'Your job is to review the changed code, not to explain what the system does.',
         'Focus only on correctness, regressions, maintainability, and missing tests in the included diff.',
-        'Do not summarize the architecture.',
-        'Do not explain the script workflow.',
-        'Do not describe the purpose of the automation unless it is directly relevant to a concrete risk.',
-        'Do not repeat the diff back to the reader.',
+        'Do not summarize the architecture. Do not explain the script workflow.',
         'If there are no meaningful concerns, say that clearly.',
-        'This review is advisory. Do not claim to approve or block the PR on behalf of GitHub.',
         'Respond with JSON only. Do not wrap the JSON in Markdown fences.',
-        'Return exactly one JSON object with this schema:',
-        '{"summary":"string","whatLooksGood":["string"],"risks":["string"],"suggestedImprovements":["string"],"verdict":"string"}',
-        '',
-        'JSON rules:',
-        '- Keep every value short and specific.',
-        '- Mention file paths inside items when you call out a risk or suggestion.',
-        '- "whatLooksGood", "risks", and "suggestedImprovements" must always be arrays of strings.',
-        '- If there are no major risks, set "risks" to ["No major risks found in the included diff."].',
-        '- If there are no follow-up changes, set "suggestedImprovements" to ["No follow-up changes are required based on the included diff."].',
-        '- "verdict" must be one short sentence only.',
-        '',
+        'Do not add conversational filler before or after the JSON.',
+        'Keep every value short and specific. Mention file paths when you call out a risk or suggestion.',
+        '"whatLooksGood", "risks", and "suggestedImprovements" must always be arrays of strings.',
+        'If there are no major risks, set "risks" to ["No major risks found in the included diff."].',
+        'If there are no follow-up changes, set "suggestedImprovements" to ["No follow-up changes are required based on the included diff."].',
+        '"verdict" must be one short sentence only.',
+    ].join('\n');
+
+    const userPrompt = [
         `Pull request: #${params.pullRequestNumber}`,
-        `URL: ${params.url}`,
-        `Base ref: ${params.baseRef}`,
         `Title: ${params.title}`,
         `Body:\n${params.body || '(empty)'}`,
         '',
@@ -187,6 +207,11 @@ function buildPrompt(params: {
         params.diff || '# No diff content available after filtering.',
         '```',
     ].join('\n');
+
+    return [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+    ];
 }
 
 async function ensureModelExists(ollamaUrl: string, model: string): Promise<void> {
@@ -210,34 +235,35 @@ async function ensureModelExists(ollamaUrl: string, model: string): Promise<void
 async function requestReviewFromOllama(
     ollamaUrl: string,
     model: string,
-    prompt: string
+    messages: OllamaChatMessage[]
 ): Promise<string> {
-    const response = await fetch(`${ollamaUrl}/api/generate`, {
+    const response = await fetch(`${ollamaUrl}/api/chat`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
         body: JSON.stringify({
             model,
-            prompt,
+            messages,
+            format: REVIEW_PAYLOAD_SCHEMA,
             stream: false,
             options: {
-                temperature: 0.2,
+                temperature: 0,
             },
         }),
     });
 
     if (!response.ok) {
-        throw new Error(`Ollama generate failed: ${response.status} ${response.statusText}`);
+        throw new Error(`Ollama chat failed: ${response.status} ${response.statusText}`);
     }
 
-    const payload = (await response.json()) as OllamaGenerateResponse;
+    const payload = (await response.json()) as OllamaChatResponse;
 
-    if (!payload.done || !payload.response) {
+    if (!payload.done || !payload.message?.content) {
         throw new Error(payload.error || 'Ollama returned an incomplete response.');
     }
 
-    return payload.response.trim();
+    return payload.message.content.trim();
 }
 
 function extractJsonObject(response: string): string | null {
@@ -512,7 +538,7 @@ async function main(): Promise<void> {
             : await requestReviewFromOllama(
                   ollamaUrl,
                   model,
-                  buildPrompt({
+                  buildMessages({
                       pullRequestNumber: pullRequest.number,
                       title: pullRequest.title,
                       body: pullRequest.body || '',
