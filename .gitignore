@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+actions-runner/
 
 npm-debug.log*
 yarn-debug.log*
