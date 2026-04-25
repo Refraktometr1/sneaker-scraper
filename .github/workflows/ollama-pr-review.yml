@@ -48,4 +48,5 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           OLLAMA_BASE_REF: origin/${{ github.event.pull_request.base.ref }}
           OLLAMA_MODEL: gemma4:26b
+          OLLAMA_REQUEST_TIMEOUT_MS: 240000
         run: npx ts-node scripts/ollama-pr-review.ts
