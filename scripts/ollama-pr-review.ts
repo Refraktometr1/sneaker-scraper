@@ -8,6 +8,7 @@ const DEFAULT_BASE_REF = 'origin/main';
 const MAX_FILES_IN_PROMPT = 20;
 const MAX_DIFF_CHARACTERS = 45_000;
 const MAX_COMMENT_CHARACTERS = 60_000;
+const OLLAMA_RETRY_DELAY_MS = 2_000;
 const REVIEW_PAYLOAD_SCHEMA = {
     type: 'object',
     properties: {
@@ -89,6 +90,8 @@ interface GitHubCommentsResponse {
     message?: string;
 }
 
+type OllamaResponseFormat = typeof REVIEW_PAYLOAD_SCHEMA | 'json';
+
 function getRequiredEnv(name: string): string {
     const value = process.env[name];
 
@@ -111,6 +114,12 @@ function runGit(args: string[]): string {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
 }
 
 function getChangedFiles(diffRange: string): string[] {
@@ -190,6 +199,7 @@ function buildMessages(params: {
         'If there are no major risks, set "risks" to ["No major risks found in the included diff."].',
         'If there are no follow-up changes, set "suggestedImprovements" to ["No follow-up changes are required based on the included diff."].',
         '"verdict" must be one short sentence only.',
+        'Do not use approval or rejection wording such as "approved", "rejected", "blocked", or "merge".',
     ].join('\n');
 
     const userPrompt = [
@@ -237,6 +247,48 @@ async function requestReviewFromOllama(
     model: string,
     messages: OllamaChatMessage[]
 ): Promise<string> {
+    const errors: string[] = [];
+
+    for (const format of [REVIEW_PAYLOAD_SCHEMA, 'json'] as const) {
+        try {
+            return await requestOllamaChat(ollamaUrl, model, messages, format);
+        } catch (error) {
+            errors.push(error instanceof Error ? error.message : String(error));
+        }
+    }
+
+    throw new Error(errors.join('\n'));
+}
+
+async function requestOllamaChat(
+    ollamaUrl: string,
+    model: string,
+    messages: OllamaChatMessage[],
+    format: OllamaResponseFormat
+): Promise<string> {
+    let lastError: string | undefined;
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+            return await requestOllamaChatOnce(ollamaUrl, model, messages, format);
+        } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error);
+
+            if (attempt < 2) {
+                await sleep(OLLAMA_RETRY_DELAY_MS);
+            }
+        }
+    }
+
+    throw new Error(lastError || 'Ollama chat failed.');
+}
+
+async function requestOllamaChatOnce(
+    ollamaUrl: string,
+    model: string,
+    messages: OllamaChatMessage[],
+    format: OllamaResponseFormat
+): Promise<string> {
     const response = await fetch(`${ollamaUrl}/api/chat`, {
         method: 'POST',
         headers: {
@@ -254,7 +306,13 @@ async function requestReviewFromOllama(
     });
 
     if (!response.ok) {
-        throw new Error(`Ollama chat failed: ${response.status} ${response.statusText}`);
+        const errorBody = (await response.text()).trim();
+
+        throw new Error(
+            `Ollama chat failed: ${response.status} ${response.statusText}${
+                errorBody ? ` - ${errorBody}` : ''
+            }`
+        );
     }
 
     const payload = (await response.json()) as OllamaChatResponse;
@@ -264,6 +322,54 @@ async function requestReviewFromOllama(
     }
 
     return payload.message.content.trim();
+}
+
+async function repairReviewJson(
+    ollamaUrl: string,
+    model: string,
+    rawReview: string
+): Promise<ReviewPayload | null> {
+    const repairMessages: OllamaChatMessage[] = [
+        {
+            role: 'system',
+            content: [
+                'Convert the user-provided pull request review into JSON only.',
+                'Do not add conversational text before or after the JSON.',
+                'Preserve concrete risks and suggestions.',
+                'Use short strings and keep arrays concise.',
+                'If a section has no useful content, use the default no-risk or no-follow-up wording.',
+            ].join('\n'),
+        },
+        {
+            role: 'user',
+            content: [
+                'Return one JSON object with this exact shape:',
+                JSON.stringify(REVIEW_PAYLOAD_SCHEMA),
+                '',
+                'Review text to convert:',
+                rawReview,
+            ].join('\n'),
+        },
+    ];
+
+    try {
+        const repairedReview = await requestOllamaChat(
+            ollamaUrl,
+            model,
+            repairMessages,
+            REVIEW_PAYLOAD_SCHEMA
+        );
+
+        return parseReviewPayload(repairedReview);
+    } catch (error) {
+        console.warn(
+            `Unable to repair Ollama review JSON: ${
+                error instanceof Error ? error.message : String(error)
+            }`
+        );
+
+        return null;
+    }
 }
 
 function extractJsonObject(response: string): string | null {
@@ -306,6 +412,19 @@ function normalizeStringArray(value: unknown, fallback: string): string[] {
     return [fallback];
 }
 
+function normalizeVerdict(value: unknown): string {
+    const verdict = normalizeString(
+        value,
+        'Advisory feedback only. Human review is still required before merge.'
+    );
+
+    if (/\b(approv|reject|block|merge)\w*\b/i.test(verdict)) {
+        return 'Advisory feedback only. Human review is still required before merge.';
+    }
+
+    return verdict;
+}
+
 function parseReviewPayload(response: string): ReviewPayload | null {
     const jsonObject = extractJsonObject(response);
 
@@ -333,10 +452,7 @@ function parseReviewPayload(response: string): ReviewPayload | null {
                 parsed.suggestedImprovements,
                 'No detailed suggestions were returned.'
             ),
-            verdict: normalizeString(
-                parsed.verdict,
-                'Advisory feedback only. Human review is still required before merge.'
-            ),
+            verdict: normalizeVerdict(parsed.verdict),
         };
     } catch {
         return null;
@@ -551,19 +667,20 @@ async function main(): Promise<void> {
                   })
               );
 
-    const reviewBody =
-        limitedFiles.length === 0
-            ? buildFallbackReview(
-                  'No source-code diff remained after filtering out `package-lock.json`.'
-              )
-            : (() => {
-                  const response = ollamaResponse ?? '';
-                  const parsedReview = parseReviewPayload(response);
+    let reviewBody: string;
 
-                  return parsedReview
-                      ? buildStructuredReview(parsedReview)
-                      : buildUnstructuredFallbackReview(response);
-              })();
+    if (limitedFiles.length === 0) {
+        reviewBody = buildFallbackReview(
+            'No source-code diff remained after filtering out `package-lock.json`.'
+        );
+    } else {
+        const response = ollamaResponse ?? '';
+        const parsedReview = parseReviewPayload(response) ?? (await repairReviewJson(ollamaUrl, model, response));
+
+        reviewBody = parsedReview
+            ? buildStructuredReview(parsedReview)
+            : buildUnstructuredFallbackReview(response);
+    }
 
     const commentBody = buildCommentBody(model, reviewBody);
 
