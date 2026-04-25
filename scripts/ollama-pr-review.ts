@@ -297,7 +297,7 @@ async function requestOllamaChatOnce(
         body: JSON.stringify({
             model,
             messages,
-            format: REVIEW_PAYLOAD_SCHEMA,
+            format,
             stream: false,
             options: {
                 temperature: 0,
@@ -569,6 +569,34 @@ function buildFallbackReview(message: string): string {
     ].join('\n');
 }
 
+function normalizeMarkdownListMessage(message: string): string {
+    const normalized = message.replace(/\s+/g, ' ').trim();
+
+    return normalized || 'Ollama did not return a usable response.';
+}
+
+function buildOllamaUnavailableReview(message: string): string {
+    const normalizedMessage = normalizeMarkdownListMessage(message);
+
+    return [
+        '## Summary',
+        'The local Ollama model did not complete the automated PR review.',
+        '',
+        '## What looks good',
+        '- The PR review workflow reached the model review step.',
+        '',
+        '## Risks',
+        `- ${normalizedMessage}`,
+        '- No automated code findings were generated for this run.',
+        '',
+        '## Suggested improvements',
+        '- Re-run the workflow after checking the local Ollama service and model health.',
+        '',
+        '## Verdict',
+        'Advisory feedback only. Human review is still required before merge.',
+    ].join('\n');
+}
+
 function buildCommentBody(model: string, reviewBody: string): string {
     return truncateCommentBody([
         COMMENT_MARKER,
@@ -682,27 +710,30 @@ async function main(): Promise<void> {
     const omittedFileCount = Math.max(changedFiles.length - limitedFiles.length, 0);
     const rawDiff = getDiffForFiles(diffRange, limitedFiles);
     const { diff, truncated } = trimDiff(rawDiff);
+    const originalMessages = buildMessages({
+        pullRequestNumber: pullRequest.number,
+        title: pullRequest.title,
+        body: pullRequest.body || '',
+        url: pullRequest.html_url,
+        baseRef: diffBaseRef,
+        changedFiles: limitedFiles,
+        omittedFileCount,
+        diff,
+        diffWasTruncated: truncated,
+    });
 
-    await ensureModelExists(ollamaUrl, model);
+    let ollamaError: string | null = null;
+    let ollamaResponse: string | null = null;
 
-    const ollamaResponse =
-        limitedFiles.length === 0
-            ? null
-            : await requestReviewFromOllama(
-                  ollamaUrl,
-                  model,
-                  buildMessages({
-                      pullRequestNumber: pullRequest.number,
-                      title: pullRequest.title,
-                      body: pullRequest.body || '',
-                      url: pullRequest.html_url,
-                      baseRef: diffBaseRef,
-                      changedFiles: limitedFiles,
-                      omittedFileCount,
-                      diff,
-                      diffWasTruncated: truncated,
-                  })
-              );
+    if (limitedFiles.length > 0) {
+        try {
+            await ensureModelExists(ollamaUrl, model);
+            ollamaResponse = await requestReviewFromOllama(ollamaUrl, model, originalMessages);
+        } catch (error) {
+            ollamaError = error instanceof Error ? error.message : String(error);
+            console.warn(`Ollama review unavailable: ${ollamaError}`);
+        }
+    }
 
     let reviewBody: string;
 
@@ -710,19 +741,10 @@ async function main(): Promise<void> {
         reviewBody = buildFallbackReview(
             'No source-code diff remained after filtering out `package-lock.json`.'
         );
+    } else if (ollamaError) {
+        reviewBody = buildOllamaUnavailableReview(ollamaError);
     } else {
         const response = ollamaResponse ?? '';
-        const originalMessages = buildMessages({
-            pullRequestNumber: pullRequest.number,
-            title: pullRequest.title,
-            body: pullRequest.body || '',
-            url: pullRequest.html_url,
-            baseRef: diffBaseRef,
-            changedFiles: limitedFiles,
-            omittedFileCount,
-            diff,
-            diffWasTruncated: truncated,
-        });
         const parsedReview =
             parseReviewPayload(response) ??
             (await repairReviewJson(ollamaUrl, model, response, originalMessages));
