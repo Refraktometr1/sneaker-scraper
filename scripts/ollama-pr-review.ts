@@ -327,26 +327,29 @@ async function requestOllamaChatOnce(
 async function repairReviewJson(
     ollamaUrl: string,
     model: string,
-    rawReview: string
+    rawReview: string,
+    originalMessages: OllamaChatMessage[]
 ): Promise<ReviewPayload | null> {
     const repairMessages: OllamaChatMessage[] = [
         {
             role: 'system',
             content: [
-                'Convert the user-provided pull request review into JSON only.',
+                'Produce a concise JSON pull request review using the original diff context.',
                 'Do not add conversational text before or after the JSON.',
-                'Preserve concrete risks and suggestions.',
-                'Use short strings and keep arrays concise.',
-                'If a section has no useful content, use the default no-risk or no-follow-up wording.',
+                'Ignore generic explanations about what the automation or repository does.',
+                'Only include findings grounded in changed lines from the diff.',
+                'If the previous review only described the system, discard it and write no-risk/no-follow-up defaults.',
+                'Keep every field short and specific.',
             ].join('\n'),
         },
+        ...originalMessages,
         {
             role: 'user',
             content: [
-                'Return one JSON object with this exact shape:',
+                'The previous model response was not useful enough. Rewrite it as one JSON object with this exact shape:',
                 JSON.stringify(REVIEW_PAYLOAD_SCHEMA),
                 '',
-                'Review text to convert:',
+                'Previous response to avoid preserving unless it contains concrete diff-grounded findings:',
                 rawReview,
             ].join('\n'),
         },
@@ -425,6 +428,40 @@ function normalizeVerdict(value: unknown): string {
     return verdict;
 }
 
+function buildNoConcreteFindingsReview(): ReviewPayload {
+    return {
+        summary: 'The local model did not identify concrete diff-grounded issues.',
+        whatLooksGood: ['The changed files were reviewed by the local Ollama model.'],
+        risks: ['No major risks found in the included diff.'],
+        suggestedImprovements: [
+            'No follow-up changes are required based on the included diff.',
+        ],
+        verdict: 'Advisory feedback only. Human review is still required before merge.',
+    };
+}
+
+function isGenericExplanationReview(review: ReviewPayload): boolean {
+    const reviewText = [
+        review.summary,
+        ...review.whatLooksGood,
+        ...review.risks,
+        ...review.suggestedImprovements,
+        review.verdict,
+    ].join(' ');
+
+    return /(\bimplementation\b|github action|local llm|ollama|automated code review|analyzing diffs|context window|privacy-conscious|cost-effective|cognitive load)/i.test(
+        reviewText
+    );
+}
+
+function normalizeReviewPayload(review: ReviewPayload): ReviewPayload {
+    if (isGenericExplanationReview(review)) {
+        return buildNoConcreteFindingsReview();
+    }
+
+    return review;
+}
+
 function parseReviewPayload(response: string): ReviewPayload | null {
     const jsonObject = extractJsonObject(response);
 
@@ -435,7 +472,7 @@ function parseReviewPayload(response: string): ReviewPayload | null {
     try {
         const parsed = JSON.parse(jsonObject) as Record<string, unknown>;
 
-        return {
+        return normalizeReviewPayload({
             summary: normalizeString(
                 parsed.summary,
                 'The local model returned feedback, but the summary field was empty.'
@@ -453,7 +490,7 @@ function parseReviewPayload(response: string): ReviewPayload | null {
                 'No detailed suggestions were returned.'
             ),
             verdict: normalizeVerdict(parsed.verdict),
-        };
+        });
     } catch {
         return null;
     }
@@ -675,7 +712,20 @@ async function main(): Promise<void> {
         );
     } else {
         const response = ollamaResponse ?? '';
-        const parsedReview = parseReviewPayload(response) ?? (await repairReviewJson(ollamaUrl, model, response));
+        const originalMessages = buildMessages({
+            pullRequestNumber: pullRequest.number,
+            title: pullRequest.title,
+            body: pullRequest.body || '',
+            url: pullRequest.html_url,
+            baseRef: diffBaseRef,
+            changedFiles: limitedFiles,
+            omittedFileCount,
+            diff,
+            diffWasTruncated: truncated,
+        });
+        const parsedReview =
+            parseReviewPayload(response) ??
+            (await repairReviewJson(ollamaUrl, model, response, originalMessages));
 
         reviewBody = parsedReview
             ? buildStructuredReview(parsedReview)
