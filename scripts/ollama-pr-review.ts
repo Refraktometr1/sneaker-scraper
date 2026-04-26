@@ -6,9 +6,9 @@ const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 const DEFAULT_MODEL = 'gemma4:26b';
 const DEFAULT_BASE_REF = 'origin/main';
 const MAX_FILES_IN_PROMPT = 20;
-const MAX_DIFF_CHARACTERS = 45_000;
+const MAX_DIFF_CHARACTERS = 35_000;
 const MAX_COMMENT_CHARACTERS = 60_000;
-const OLLAMA_RETRY_DELAY_MS = 2_000;
+const DEFAULT_OLLAMA_REQUEST_TIMEOUT_MS = 300_000;
 const REVIEW_PAYLOAD_SCHEMA = {
     type: 'object',
     properties: {
@@ -102,6 +102,26 @@ function getRequiredEnv(name: string): string {
     return value;
 }
 
+function getPositiveIntegerEnv(name: string, defaultValue: number): number {
+    const value = process.env[name];
+
+    if (value === undefined) {
+        return defaultValue;
+    }
+
+    const parsedValue = Number(value);
+
+    if (!Number.isInteger(parsedValue) || parsedValue <= 0) {
+        throw new Error(`Environment variable ${name} must be a positive integer.`);
+    }
+
+    return parsedValue;
+}
+
+function isRequestTimeoutError(error: unknown): boolean {
+    return error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+}
+
 function readEventPayload(): PullRequestEvent {
     const eventPath = getRequiredEnv('GITHUB_EVENT_PATH');
     const rawEvent = readFileSync(eventPath, 'utf8');
@@ -114,12 +134,6 @@ function runGit(args: string[]): string {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
-}
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-        setTimeout(resolve, ms);
-    });
 }
 
 function getChangedFiles(diffRange: string): string[] {
@@ -224,8 +238,25 @@ function buildMessages(params: {
     ];
 }
 
-async function ensureModelExists(ollamaUrl: string, model: string): Promise<void> {
-    const response = await fetch(`${ollamaUrl}/api/tags`);
+async function ensureModelExists(
+    ollamaUrl: string,
+    model: string,
+    requestTimeoutMs: number
+): Promise<void> {
+    let response: Response;
+
+    try {
+        response = await fetch(`${ollamaUrl}/api/tags`, {
+            signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+    } catch (error) {
+        if (isRequestTimeoutError(error)) {
+            throw new Error(`Ollama model list timed out after ${requestTimeoutMs} ms.`);
+        }
+
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Unable to query Ollama models: ${message}`);
+    }
 
     if (!response.ok) {
         throw new Error(`Unable to query Ollama models: ${response.status} ${response.statusText}`);
@@ -245,65 +276,73 @@ async function ensureModelExists(ollamaUrl: string, model: string): Promise<void
 async function requestReviewFromOllama(
     ollamaUrl: string,
     model: string,
-    messages: OllamaChatMessage[]
+    messages: OllamaChatMessage[],
+    requestTimeoutMs: number
 ): Promise<string> {
     const errors: string[] = [];
 
     for (const format of [REVIEW_PAYLOAD_SCHEMA, 'json'] as const) {
         try {
-            return await requestOllamaChat(ollamaUrl, model, messages, format);
+            return await requestOllamaChat(
+                ollamaUrl,
+                model,
+                messages,
+                format,
+                requestTimeoutMs
+            );
         } catch (error) {
             errors.push(error instanceof Error ? error.message : String(error));
         }
     }
 
-    throw new Error(errors.join('\n'));
+    throw new Error([...new Set(errors)].join('\n'));
 }
 
 async function requestOllamaChat(
     ollamaUrl: string,
     model: string,
     messages: OllamaChatMessage[],
-    format: OllamaResponseFormat
+    format: OllamaResponseFormat,
+    requestTimeoutMs: number
 ): Promise<string> {
-    let lastError: string | undefined;
-
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-        try {
-            return await requestOllamaChatOnce(ollamaUrl, model, messages, format);
-        } catch (error) {
-            lastError = error instanceof Error ? error.message : String(error);
-
-            if (attempt < 2) {
-                await sleep(OLLAMA_RETRY_DELAY_MS);
-            }
-        }
-    }
-
-    throw new Error(lastError || 'Ollama chat failed.');
+    return requestOllamaChatOnce(ollamaUrl, model, messages, format, requestTimeoutMs);
 }
 
 async function requestOllamaChatOnce(
     ollamaUrl: string,
     model: string,
     messages: OllamaChatMessage[],
-    format: OllamaResponseFormat
+    format: OllamaResponseFormat,
+    requestTimeoutMs: number
 ): Promise<string> {
-    const response = await fetch(`${ollamaUrl}/api/chat`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            model,
-            messages,
-            format: REVIEW_PAYLOAD_SCHEMA,
-            stream: false,
-            options: {
-                temperature: 0,
+    let response: Response;
+
+    try {
+        response = await fetch(`${ollamaUrl}/api/chat`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
             },
-        }),
-    });
+            body: JSON.stringify({
+                model,
+                messages,
+                format,
+                stream: false,
+                options: {
+                    temperature: 0,
+                },
+            }),
+            signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+
+        if (isRequestTimeoutError(error)) {
+            throw new Error(`Ollama chat timed out after ${requestTimeoutMs} ms.`);
+        }
+
+        throw new Error(`Ollama chat request failed: ${errorMessage}`);
+    }
 
     if (!response.ok) {
         const errorBody = (await response.text()).trim();
@@ -328,7 +367,8 @@ async function repairReviewJson(
     ollamaUrl: string,
     model: string,
     rawReview: string,
-    originalMessages: OllamaChatMessage[]
+    originalMessages: OllamaChatMessage[],
+    requestTimeoutMs: number
 ): Promise<ReviewPayload | null> {
     const repairMessages: OllamaChatMessage[] = [
         {
@@ -360,7 +400,8 @@ async function repairReviewJson(
             ollamaUrl,
             model,
             repairMessages,
-            REVIEW_PAYLOAD_SCHEMA
+            REVIEW_PAYLOAD_SCHEMA,
+            requestTimeoutMs
         );
 
         return parseReviewPayload(repairedReview);
@@ -569,6 +610,34 @@ function buildFallbackReview(message: string): string {
     ].join('\n');
 }
 
+function normalizeMarkdownListMessage(message: string): string {
+    const normalized = message.replace(/\s+/g, ' ').trim();
+
+    return normalized || 'Ollama did not return a usable response.';
+}
+
+function buildOllamaUnavailableReview(message: string): string {
+    const normalizedMessage = normalizeMarkdownListMessage(message);
+
+    return [
+        '## Summary',
+        'The local Ollama model did not complete the automated PR review.',
+        '',
+        '## What looks good',
+        '- The PR review workflow reached the model review step.',
+        '',
+        '## Risks',
+        `- ${normalizedMessage}`,
+        '- No automated code findings were generated for this run.',
+        '',
+        '## Suggested improvements',
+        '- Re-run the workflow after checking the local Ollama service and model health.',
+        '',
+        '## Verdict',
+        'Advisory feedback only. Human review is still required before merge.',
+    ].join('\n');
+}
+
 function buildCommentBody(model: string, reviewBody: string): string {
     return truncateCommentBody([
         COMMENT_MARKER,
@@ -672,6 +741,10 @@ async function main(): Promise<void> {
     const ollamaUrl = process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_URL;
     const model = process.env.OLLAMA_MODEL || DEFAULT_MODEL;
     const diffBaseRef = process.env.OLLAMA_BASE_REF || DEFAULT_BASE_REF;
+    const requestTimeoutMs = getPositiveIntegerEnv(
+        'OLLAMA_REQUEST_TIMEOUT_MS',
+        DEFAULT_OLLAMA_REQUEST_TIMEOUT_MS
+    );
     const dryRun = process.env.OLLAMA_REVIEW_DRY_RUN === '1';
     const repository = process.env.GITHUB_REPOSITORY;
 
@@ -682,27 +755,35 @@ async function main(): Promise<void> {
     const omittedFileCount = Math.max(changedFiles.length - limitedFiles.length, 0);
     const rawDiff = getDiffForFiles(diffRange, limitedFiles);
     const { diff, truncated } = trimDiff(rawDiff);
+    const originalMessages = buildMessages({
+        pullRequestNumber: pullRequest.number,
+        title: pullRequest.title,
+        body: pullRequest.body || '',
+        url: pullRequest.html_url,
+        baseRef: diffBaseRef,
+        changedFiles: limitedFiles,
+        omittedFileCount,
+        diff,
+        diffWasTruncated: truncated,
+    });
 
-    await ensureModelExists(ollamaUrl, model);
+    let ollamaError: string | null = null;
+    let ollamaResponse: string | null = null;
 
-    const ollamaResponse =
-        limitedFiles.length === 0
-            ? null
-            : await requestReviewFromOllama(
-                  ollamaUrl,
-                  model,
-                  buildMessages({
-                      pullRequestNumber: pullRequest.number,
-                      title: pullRequest.title,
-                      body: pullRequest.body || '',
-                      url: pullRequest.html_url,
-                      baseRef: diffBaseRef,
-                      changedFiles: limitedFiles,
-                      omittedFileCount,
-                      diff,
-                      diffWasTruncated: truncated,
-                  })
-              );
+    if (limitedFiles.length > 0) {
+        try {
+            await ensureModelExists(ollamaUrl, model, requestTimeoutMs);
+            ollamaResponse = await requestReviewFromOllama(
+                ollamaUrl,
+                model,
+                originalMessages,
+                requestTimeoutMs
+            );
+        } catch (error) {
+            ollamaError = error instanceof Error ? error.message : String(error);
+            console.warn(`Ollama review unavailable: ${ollamaError}`);
+        }
+    }
 
     let reviewBody: string;
 
@@ -710,22 +791,19 @@ async function main(): Promise<void> {
         reviewBody = buildFallbackReview(
             'No source-code diff remained after filtering out `package-lock.json`.'
         );
+    } else if (ollamaError) {
+        reviewBody = buildOllamaUnavailableReview(ollamaError);
     } else {
         const response = ollamaResponse ?? '';
-        const originalMessages = buildMessages({
-            pullRequestNumber: pullRequest.number,
-            title: pullRequest.title,
-            body: pullRequest.body || '',
-            url: pullRequest.html_url,
-            baseRef: diffBaseRef,
-            changedFiles: limitedFiles,
-            omittedFileCount,
-            diff,
-            diffWasTruncated: truncated,
-        });
         const parsedReview =
             parseReviewPayload(response) ??
-            (await repairReviewJson(ollamaUrl, model, response, originalMessages));
+            (await repairReviewJson(
+                ollamaUrl,
+                model,
+                response,
+                originalMessages,
+                requestTimeoutMs
+            ));
 
         reviewBody = parsedReview
             ? buildStructuredReview(parsedReview)
