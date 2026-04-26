@@ -142,6 +142,10 @@ interface ScrapedSneaker extends SneakerResponse {
     productCode?: string;
 }
 
+interface InsertableSneaker extends ScrapedSneaker {
+    productCode: string;
+}
+
 const OCHSNER_SNEAKERS_URL =
     'https://www.ochsnersport.ch/de/shop/herren-schuhe-sneakers-alle-sneakermarken-00044952-c.html';
 const MIN_SEARCH_RESULTS = 10;
@@ -324,30 +328,49 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
             ({ productCode: _productCode, ...responseSneaker }) => responseSneaker
         );
 
-        // 4. Save the scraped data to Postgres
-        const insertQuery = `
-            INSERT INTO sneakers (brand, model, price, product_code)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (product_code) DO NOTHING
-        `;
-        let savedCount = 0;
+        const insertableSneakers: InsertableSneaker[] = sneakers.filter(
+            (sneaker): sneaker is InsertableSneaker => {
+                if (sneaker.productCode) {
+                    return true;
+                }
 
-        for (const sneaker of sneakers) {
-            if (!sneaker.productCode) {
                 console.warn(
                     `Skipping sneaker without productCode: ${sneaker.brand} ${sneaker.model}`
                 );
-                continue;
+
+                return false;
             }
+        );
+        let savedCount = 0;
 
-            const insertResult = await pool.query(insertQuery, [
-                sneaker.brand,
-                sneaker.model,
-                sneaker.price,
-                sneaker.productCode,
-            ]);
+        if (insertableSneakers.length > 0) {
+            const values: string[] = [];
+            const queryParams: string[] = [];
 
-            savedCount += insertResult.rowCount ?? 0;
+            insertableSneakers.forEach((sneaker, index) => {
+                const parameterIndex = index * 4;
+
+                values.push(
+                    `($${parameterIndex + 1}, $${parameterIndex + 2}, $${parameterIndex + 3}, $${parameterIndex + 4})`
+                );
+                queryParams.push(sneaker.brand, sneaker.model, sneaker.price, sneaker.productCode);
+            });
+
+            const insertQuery = `
+                INSERT INTO sneakers (brand, model, price, product_code)
+                VALUES ${values.join(', ')}
+                ON CONFLICT (product_code) DO NOTHING
+            `;
+            let client: PoolClient | undefined;
+
+            try {
+                client = await pool.connect();
+
+                const insertResult = await client.query(insertQuery, queryParams);
+                savedCount = insertResult.rowCount ?? 0;
+            } finally {
+                client?.release();
+            }
         }
 
         console.log(`Successfully scraped and saved ${savedCount} sneakers to Postgres!`);
