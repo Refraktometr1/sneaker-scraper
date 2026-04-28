@@ -15,6 +15,10 @@
 - **Test:** `npm test`
 - **Lint:** not configured
 
+## Project Behavior
+- Server startup must wait for successful database initialization
+- If database initialization fails, the API must not start listening
+
 ## Do
 - Read existing code before modifying anything
 - Match existing patterns, naming, and style

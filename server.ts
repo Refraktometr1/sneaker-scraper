@@ -161,7 +161,7 @@ const pool = new Pool({
 });
 
 // Function to initialize the database table
-async function initDB() {
+async function initDB(): Promise<void> {
     const createTableQuery = `
         CREATE TABLE IF NOT EXISTS sneakers (
             id SERIAL PRIMARY KEY,
@@ -224,13 +224,11 @@ async function initDB() {
             });
         }
         console.error('Error initializing database:', err);
+        throw err;
     } finally {
         client?.release();
     }
 }
-
-// Run the initialization
-initDB();
 
 // 2. Create the Scraping Endpoint
 app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
@@ -391,7 +389,21 @@ app.get('/scrape', async (req: Request, res: Response): Promise<void> => {
 });
 
 // Start the server
-app.listen(config.port, () => {
-    console.log(`Server is running at http://localhost:${config.port}`);
-    console.log(`To trigger the scraper, visit http://localhost:${config.port}/scrape`);
+async function startServer(): Promise<void> {
+    await initDB();
+
+    app.listen(config.port, () => {
+        console.log(`Server is running at http://localhost:${config.port}`);
+        console.log(`To trigger the scraper, visit http://localhost:${config.port}/scrape`);
+    });
+}
+
+startServer().catch(async (error) => {
+    console.error('Server startup failed:', error);
+
+    await pool.end().catch((poolError) => {
+        console.error('Error closing database pool after startup failure:', poolError);
+    });
+
+    process.exit(1);
 });
