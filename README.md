@@ -7,6 +7,7 @@ Small TypeScript API that scrapes sneaker products from Ochsner Sport and saves 
 This project:
 
 - starts an Express server on port `3000`
+- waits for successful PostgreSQL initialization before listening
 - opens the Ochsner Sport sneaker listing page with Puppeteer
 - reads the first 10 product results
 - extracts `brand`, `model`, `price`, `oldPrice`, and `url`
@@ -42,6 +43,8 @@ cp .env.example .env
 ```
 
 The app loads `.env` automatically on startup. If `PORT` or `DB_PORT` is invalid, or if a required value is blank, the server exits with a clear configuration error.
+
+The server also waits for database initialization before listening. If PostgreSQL setup fails, startup stops and the process exits with code `1`.
 
 Default local values used when a variable is not set:
 
@@ -181,7 +184,7 @@ Successful requests return JSON with:
 
 ## Database
 
-On startup, the app creates the `sneakers` table if it does not exist.
+On startup, the app creates the `sneakers` table if it does not exist. The API does not start listening until this setup succeeds.
 
 Stored columns:
 
